@@ -81,6 +81,7 @@ typedef struct {
     unsigned long curr_send_size; // size of leftover data to send
 
     req_info_t *req_list;
+    unsigned int serialize_request;
     pthread_mutex_t mtx;
 } conn_info_t;
 
@@ -800,11 +801,13 @@ void close_and_forget(int epollfd, int sock) {
     close(sock);
 }
 
-int process_messages(req_info_t *req, int epollfd, thread_info_t *infos) {
+// returns 1 if the message has been completely executed, 0 if the message need more time, -1 if some error occured
+int process_single_message(req_info_t *req, int epollfd, thread_info_t *infos){
     message_t *m = req_get_message(req);
 
+    cw_log("PROCESS req_id: %d, rip: %d, total cmd: %d\n", req->req_id, req->curr_cmd_id, m->num);
     for (int i = req->curr_cmd_id; i < m->num; i++) {
-        cw_log("req_id: %d, execute command: %s\n", req->req_id, get_command_name(m->cmds[i].cmd));
+        cw_log("PROCESS req_id: %d,  rip: %d, command: %s\n", req->req_id, i, get_command_name(m->cmds[i].cmd));
 
         switch(m->cmds[i].cmd){
         case COMPUTE:
@@ -815,18 +818,18 @@ int process_messages(req_info_t *req, int epollfd, thread_info_t *infos) {
             int to_skip = start_forward(req, m, i, epollfd, infos);
             if (to_skip == 0) {
                 fprintf(stderr, "Error: could not execute FORWARD\n");
-                return 0;
+                return -1;
             }
             req->curr_cmd_id = i;
-            return 1;
+            return 0;
         case REPLY:
             cw_log("Handling REPLY: req_id=%d\n", m->req_id);
             if (!reply(req, m, i)) {
                 fprintf(stderr, "reply() failed\n");
-                return 0;
+                return -1;
             }
             // any further cmds[] for replied-to hop, not me
-            break;
+            return 1;
         case STORE:
         case LOAD:
             check(storage_path, "Error: Cannot execute LOAD/STORE cmd because no storage path has been defined");
@@ -842,7 +845,7 @@ int process_messages(req_info_t *req, int epollfd, thread_info_t *infos) {
             }
 
             req->curr_cmd_id = i+1;
-            return 1;
+            return 0;
         default:
             fprintf(stderr, "Error: Unknown cmd: %d\n", m->cmds[0].cmd);
             return 0;
@@ -852,10 +855,21 @@ int process_messages(req_info_t *req, int epollfd, thread_info_t *infos) {
     return 1;
 }
 
+int process_messages(req_info_t *req, int epollfd, thread_info_t *infos) {
+    int executed = process_single_message(req, epollfd, infos);
+    cw_log("PROCESS_MESSAGES %d, %d\n", executed, conns[req->conn_id].serialize_request);
+    if(executed && conns[req->conn_id].serialize_request)
+        return obtain_messages(req->conn_id, epollfd, infos);
+    return executed;
+}
+
 int obtain_messages(int conn_id, int epollfd, thread_info_t* infos) {
     unsigned long msg_size = conns[conn_id].curr_recv_buf - conns[conn_id].curr_proc_buf;
 
     // batch processing of multiple messages, if received more than 1
+    if(conns[conn_id].serialize_request && conns[conn_id].req_list != NULL)
+        return 1;
+
     do {
         if (msg_size < sizeof(message_t)) {
             cw_log("Got incomplete header [recv size:%lu, header size:%lu], need to recv() more...\n", msg_size, sizeof(message_t));
@@ -885,7 +899,11 @@ int obtain_messages(int conn_id, int epollfd, thread_info_t* infos) {
             req_info_t *req = req_create(conn_id);
             req->message_ptr = (unsigned char*) m;
             req->curr_cmd_id = 0;
-            process_messages(req, epollfd, infos);
+            int executed = process_single_message(req, epollfd, infos);
+            if(!executed && conns[conn_id].serialize_request){
+                conns[conn_id].curr_proc_buf += m->req_size;
+                return 1;
+            }
         }
 
         conns[conn_id].curr_proc_buf += m->req_size;
@@ -961,6 +979,7 @@ int conn_alloc(int conn_sock) {
     conns[conn_id].curr_recv_size = BUF_SIZE;
     conns[conn_id].curr_send_buf = conns[conn_id].send_buf;
     conns[conn_id].curr_send_size = 0;
+    conns[conn_id].serialize_request = 0;
 
     if (nthread > 1)
         sys_check(pthread_mutex_unlock(&conns[conn_id].mtx));
