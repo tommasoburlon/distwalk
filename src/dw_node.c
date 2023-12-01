@@ -149,6 +149,7 @@ typedef struct {
     int req_id;
     int conn_id;
     int fwd_replies_left;
+    int timer;
 } req_info_t;
 
 req_info_t reqs[MAX_REQS];
@@ -473,6 +474,22 @@ int start_forward(int conn_id, message_t *m, int cmd_id, int epollfd) {
     if (!start_send(fwd_conn_id, m_dst->req_size))
         return 0;
         
+    if (m->cmds[cmd_id].u.fwd.timeout) {
+        struct itimerspec timerspec = {0};
+        int timerfd = timerfd_create(CLOCK_BOOTTIME, TFD_NONBLOCK);
+        timerspec.it_value.tv_sec = (m->cmds[cmd_id].u.fwd.timeout / 1000000);
+        timerspec.it_value.tv_nsec = (m->cmds[cmd_id].u.fwd.timeout % 1000000) * 1000;
+        sys_check(timerfd_settime(timerfd, 0, &timerspec, NULL));
+
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLONESHOT;
+        ev.data.u64 = i2l(TIMER, m->req_id % MAX_REQS);
+        cw_log("Adding timer(%d usecs) fd %d to epollfd %d\n", m->cmds[cmd_id].u.fwd.timeout, timerfd, epollfd);
+        sys_check(epoll_ctl(epollfd, EPOLL_CTL_ADD, timerfd, &ev));
+
+        reqs[m->req_id % MAX_REQS].timer = timerfd;
+    }
+
     if (cmd_id == 0 || m->cmds[cmd_id-1].cmd != MULTI_FORWARD) {
         reqs[m->req_id % MAX_REQS].req_id = m->req_id;
         reqs[m->req_id % MAX_REQS].conn_id = conn_id;
@@ -498,6 +515,11 @@ int handle_forward_reply(int req_id, int epollfd, thread_info_t* infos) {
         if (--reqs[req_id % MAX_REQS].fwd_replies_left == 0) {
             reqs[req_id % MAX_REQS].req_id = -1;
             conns[conn_id].status &= ~FORWARDING;
+            int rv = epoll_ctl(epollfd, EPOLL_CTL_DEL, reqs[req_id % MAX_REQS].timer, NULL);
+            if (rv < 0 && errno != ENOENT) {
+                perror("Error while deleting timer");
+                exit(EXIT_FAILURE);
+            }
 
             return process_messages(conn_id, epollfd, infos);
         }
@@ -893,12 +915,28 @@ void setnonblocking(int fd) {
     assert(fcntl(fd, F_SETFL, flags) == 0);
 }
 
+void handle_timeout(int req_id, thread_info_t *info) {
+    if(reqs[req_id].req_id == req_id){
+        reqs[req_id].req_id = -1;
+        close(reqs[req_id].timer);
+    }
+}
+
 void exec_request(int epollfd, const struct epoll_event *p_ev, thread_info_t* infos) {
     int id;
     event_type type;
     l2i(p_ev->data.u64, (uint32_t*)&type, (uint32_t*) &id);
     
     cw_log("event_type=%d, id=%d\n", type, id);
+
+    if (type == TIMER) {
+        cw_log("conn: %d timer expired\n", id);
+        handle_timeout(id, infos);
+        return;
+    }
+
+    if (type == SOCKET && (conns[id].sock == -1 || conns[id].recv_buf == NULL))
+            return;
 
     if (p_ev->events & EPOLLIN) {
         cw_log("calling recv_mesg()\n");
