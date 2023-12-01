@@ -153,6 +153,7 @@ typedef struct {
 } req_info_t;
 
 req_info_t reqs[MAX_REQS];
+int last_reqs = 0;
 
 char *bind_name = "0.0.0.0";
 int bind_port = 7891;
@@ -221,6 +222,19 @@ int conn_find_sock(int sock) {
         sys_check(pthread_mutex_unlock(&socks_mtx));
 
     return rv;
+}
+
+message_t* req_get_message(int req_id){
+    assert(reqs[req_id % MAX_REQS].req_id == req_id);
+
+    int conn_id = reqs[req_id % MAX_REQS].conn_id;
+    message_t *m = (message_t *)conns[conn_id].curr_proc_buf;
+    unsigned long msg_size = conns[conn_id].curr_recv_buf - conns[conn_id].curr_proc_buf;
+    
+    assert(msg_size >= m->req_size);
+    assert(m->req_size >= sizeof(message_t) && m->req_size <= BUF_SIZE);
+    
+    return m;
 }
 
 #define MAX_STORAGE_SIZE 1000000
@@ -396,6 +410,26 @@ int copy_tail(message_t *m, message_t *m_dst, int cmd_id) {
     return m_dst->num;
 }
 
+int skip_cmds(message_t* m, int cmd_id, int to_skip) {
+    int i = cmd_id, skipped = to_skip;
+
+    while (i < m->num && skipped > 0) {
+        int nested_fwd = 0;
+
+        do {
+            if (m->cmds[i].cmd == FORWARD)
+                nested_fwd++;
+            if (m->cmds[i].cmd == REPLY)
+                nested_fwd--;
+            i++;
+        } while (i < m->num && nested_fwd > 0);
+
+        skipped--;
+    }
+
+    return i;
+}
+
 void setnonblocking(int fd);
 
 unsigned char *get_send_buf(int conn_id, size_t size);
@@ -460,9 +494,10 @@ int start_forward(int conn_id, message_t *m, int cmd_id, int epollfd) {
     }
 
     int forwarded = copy_tail(m, m_dst, j);
+    m_dst->req_id = __atomic_fetch_add(&last_reqs, 1, __ATOMIC_SEQ_CST);
     m_dst->req_size = m->cmds[cmd_id].u.fwd.pkt_size;
 
-    cw_log("Forwarding req %u to %s:%d\n", m->req_id,
+    cw_log("Forwarding req %u to %s:%d\n", m_dst->req_id,
            inet_ntoa((struct in_addr){m->cmds[cmd_id].u.fwd.fwd_host}),
            ntohs(m->cmds[cmd_id].u.fwd.fwd_port));
 #ifdef CW_DEBUG
@@ -483,17 +518,17 @@ int start_forward(int conn_id, message_t *m, int cmd_id, int epollfd) {
 
         struct epoll_event ev;
         ev.events = EPOLLIN | EPOLLONESHOT;
-        ev.data.u64 = i2l(TIMER, m->req_id % MAX_REQS);
+        ev.data.u64 = i2l(TIMER, m_dst->req_id);
         cw_log("Adding timer(%d usecs) fd %d to epollfd %d\n", m->cmds[cmd_id].u.fwd.timeout, timerfd, epollfd);
         sys_check(epoll_ctl(epollfd, EPOLL_CTL_ADD, timerfd, &ev));
 
-        reqs[m->req_id % MAX_REQS].timer = timerfd;
+        reqs[m_dst->req_id % MAX_REQS].timer = timerfd;
     }
 
-    if (cmd_id == 0 || m->cmds[cmd_id-1].cmd != MULTI_FORWARD) {
-        reqs[m->req_id % MAX_REQS].req_id = m->req_id;
-        reqs[m->req_id % MAX_REQS].conn_id = conn_id;
-        reqs[m->req_id % MAX_REQS].fwd_replies_left = m->cmds[j + forwarded - 1].u.resp.n_ack;
+    if (cmd_id == 0 || m->cmds[cmd_id - 1].cmd != MULTI_FORWARD) {
+        reqs[m_dst->req_id % MAX_REQS].req_id = m_dst->req_id;
+        reqs[m_dst->req_id % MAX_REQS].conn_id = conn_id;
+        reqs[m_dst->req_id % MAX_REQS].fwd_replies_left = m->cmds[cmd_id + 1 + forwarded].u.resp.n_ack;
     }
 
     if (j == cmd_id + 1) {
@@ -508,23 +543,27 @@ int process_messages(int conn_id, int epollfd, thread_info_t* infos);
 
 // Call this once we received a REPLY from a socket matching a req_id we forwarded
 int handle_forward_reply(int req_id, int epollfd, thread_info_t* infos) {
-    if (reqs[req_id % MAX_REQS].req_id == req_id) {
-        cw_log("Found match with conn_id %d\n", reqs[req_id % MAX_REQS].conn_id);
-        int conn_id = reqs[req_id % MAX_REQS].conn_id;
-        
-        if (--reqs[req_id % MAX_REQS].fwd_replies_left == 0) {
-            reqs[req_id % MAX_REQS].req_id = -1;
-            conns[conn_id].status &= ~FORWARDING;
-            int rv = epoll_ctl(epollfd, EPOLL_CTL_DEL, reqs[req_id % MAX_REQS].timer, NULL);
-            if (rv < 0 && errno != ENOENT) {
-                perror("Error while deleting timer");
-                exit(EXIT_FAILURE);
-            }
-
-            return process_messages(conn_id, epollfd, infos);
-        }
-    } else {
+    if (reqs[req_id % MAX_REQS].req_id != req_id) {
         cw_log("Could not match a response to FORWARD, req_id=%d - Dropped\n", req_id);
+        return 1;
+    }
+
+    cw_log("Found match with conn_id %d\n", reqs[req_id % MAX_REQS].conn_id);
+    int conn_id = reqs[req_id % MAX_REQS].conn_id;
+        
+    if (--reqs[req_id % MAX_REQS].fwd_replies_left == 0) {
+        message_t *m = req_get_message(req_id);
+
+        reqs[req_id % MAX_REQS].req_id = -1;
+        conns[conn_id].status &= ~FORWARDING;
+        conns[conn_id].curr_cmd_id = skip_cmds(m, conns[conn_id].curr_cmd_id, 1);
+        int rv = epoll_ctl(epollfd, EPOLL_CTL_DEL, reqs[req_id % MAX_REQS].timer, NULL);
+        if (rv < 0 && errno != ENOENT) {
+            perror("Error while deleting timer");
+            exit(EXIT_FAILURE);
+        }
+
+        return process_messages(conn_id, epollfd, infos);
     }
     
     return 1;
@@ -672,7 +711,8 @@ int process_messages(int conn_id, int epollfd, thread_info_t* infos) {
                 }
       
                 if (conns[conn_id].status & FORWARDING) {
-                    conns[conn_id].curr_cmd_id = i + to_skip + 1;
+                    conns[conn_id].curr_cmd_id = i;
+                    //conns[conn_id].curr_cmd_id = i + to_skip + 1;
                     return 1;
                 }
             } else if (m->cmds[i].cmd == REPLY) {
@@ -915,11 +955,27 @@ void setnonblocking(int fd) {
     assert(fcntl(fd, F_SETFL, flags) == 0);
 }
 
-void handle_timeout(int req_id, thread_info_t *info) {
-    if(reqs[req_id].req_id == req_id){
-        reqs[req_id].req_id = -1;
-        close(reqs[req_id].timer);
+void handle_timeout(int req_id, int epollfd, thread_info_t *info) {
+    if (reqs[req_id % MAX_REQS].req_id != req_id)
+        return;
+    int conn_id = reqs[req_id % MAX_REQS].conn_id;
+    message_t *m = req_get_message(req_id);
+
+    close(reqs[req_id % MAX_REQS].timer);
+    if (m->cmds[conns[conn_id].curr_cmd_id].u.fwd.retries > 0) {
+        cw_log("timer expired, retry: %d\n", m->cmds[conns[conn_id].curr_cmd_id].u.fwd.retries);
+        
+        m->cmds[conns[conn_id].curr_cmd_id].u.fwd.retries--;
+        process_messages(conn_id, epollfd, info);
+    } else if (m->cmds[conns[conn_id].curr_cmd_id].u.fwd.on_fail_skip > 0) {
+        cw_log("timer expired, failed, skipping: %d\n", m->cmds[conns[conn_id].curr_cmd_id].u.fwd.on_fail_skip);
+        
+        conns[conn_id].curr_cmd_id = skip_cmds(m, conns[conn_id].curr_cmd_id, m->cmds[conns[conn_id].curr_cmd_id].u.fwd.on_fail_skip);
+        process_messages(conn_id, epollfd, info);
+    } else {
+        cw_log("timer expired, failed\n");
     }
+    reqs[req_id % MAX_REQS].req_id = -1;
 }
 
 void exec_request(int epollfd, const struct epoll_event *p_ev, thread_info_t* infos) {
@@ -930,8 +986,7 @@ void exec_request(int epollfd, const struct epoll_event *p_ev, thread_info_t* in
     cw_log("event_type=%d, id=%d\n", type, id);
 
     if (type == TIMER) {
-        cw_log("conn: %d timer expired\n", id);
-        handle_timeout(id, infos);
+        handle_timeout(id, epollfd, infos);
         return;
     }
 
